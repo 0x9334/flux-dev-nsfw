@@ -1,232 +1,43 @@
-import os
-import torch
 import asyncio
-import uuid
+import base64
+import io
+import os
 import time
-from pathlib import Path
+import uuid
+import json
+from typing import Dict, Any, Optional
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Dict, Optional, Callable, Any, Awaitable
+import logging
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from fastapi import FastAPI
-from mmgp import offload, profile_type
-from loguru import logger
+import heapq
+from dataclasses import dataclass, field
+
+from fastapi import FastAPI, HTTPException
+import torch
 from diffusers import FluxPipeline
-from huggingface_hub import hf_hub_download
+from PIL import Image
+from mmgp import offload, profile_type
+from fastapi.responses import StreamingResponse
+from huggingface_hub import hf_hub_download, snapshot_download
+
+
 
 from schema import (
     ImageGenerationRequest, 
+    ImageData, 
+    ImageGenerationError, 
+    ImageGenerationErrorResponse,
     ImageSize,
+    TaskStatus,
+    TaskInfo,
+    TaskStatusResponse,
+    Priority,
+    ImageChunk,
+    QueueStats,
 )
 
 load_dotenv()
-
-class TaskStatus:
-    """Task status constants"""
-    PENDING = "pending"
-    PROCESSING = "processing"
-    COMPLETED = "completed"
-    FAILED = "failed"
-    CANCELLED = "cancelled"
-
-class QueueTask:
-    """Represents a task in the queue"""
-    def __init__(self, task_id: str, func: Callable, *args, **kwargs):
-        self.task_id = task_id
-        self.func = func
-        self.args = args
-        self.kwargs = kwargs
-        self.status = TaskStatus.PENDING
-        self.created_at = time.time()
-        self.started_at: Optional[float] = None
-        self.completed_at: Optional[float] = None
-        self.result: Any = None
-        self.error: Optional[Exception] = None
-        self.future: Optional[asyncio.Future] = None
-
-class ProductionQueueManager:
-    """Production-ready async task queue manager for image generation"""
-    
-    def __init__(self, max_queue_size: int = 100, max_concurrent: int = 1):
-        self.max_queue_size = max_queue_size
-        self.max_concurrent = max_concurrent
-        self.queue: asyncio.Queue = asyncio.Queue(maxsize=max_queue_size)
-        self.active_tasks: Dict[str, QueueTask] = {}
-        self.completed_tasks: Dict[str, QueueTask] = {}
-        self.worker_tasks: list = []
-        self.running = False
-        self._lock = asyncio.Lock()
-        self._semaphore = asyncio.Semaphore(1)  # Limit to 1 concurrent task
-        
-    async def start(self):
-        """Start the queue manager and worker tasks"""
-        if self.running:
-            logger.warning("Queue manager is already running")
-            return
-            
-        self.running = True
-        logger.info(f"Starting queue manager with semaphore limit of 1")
-        
-        # Start single worker task
-        worker_task = asyncio.create_task(self._worker("worker-0"))
-        self.worker_tasks.append(worker_task)
-            
-        logger.info("Queue manager started successfully")
-    
-    async def stop(self):
-        """Stop the queue manager and cancel all tasks"""
-        if not self.running:
-            return
-            
-        logger.info("Stopping queue manager...")
-        self.running = False
-        
-        # Cancel all worker tasks
-        for task in self.worker_tasks:
-            task.cancel()
-            
-        # Wait for workers to finish
-        await asyncio.gather(*self.worker_tasks, return_exceptions=True)
-        
-        # Cancel all pending tasks
-        async with self._lock:
-            for task in self.active_tasks.values():
-                if task.future and not task.future.done():
-                    task.future.cancel()
-                    task.status = TaskStatus.CANCELLED
-                    
-        logger.info("Queue manager stopped")
-    
-    async def submit_task(self, func: Callable, *args, **kwargs) -> str:
-        """Submit a task to the queue and return task ID"""
-        if not self.running:
-            raise RuntimeError("Queue manager is not running")
-            
-        if self.queue.full():
-            raise RuntimeError("Queue is full")
-            
-        task_id = str(uuid.uuid4())
-        task = QueueTask(task_id, func, *args, **kwargs)
-        task.future = asyncio.Future()
-        
-        async with self._lock:
-            self.active_tasks[task_id] = task
-            
-        await self.queue.put(task)
-        logger.debug(f"Task {task_id} submitted to queue")
-        
-        return task_id
-    
-    async def get_task_result(self, task_id: str, timeout: Optional[float] = None):
-        """Get the result of a task by ID"""
-        async with self._lock:
-            task = self.active_tasks.get(task_id) or self.completed_tasks.get(task_id)
-            
-        if not task:
-            raise ValueError(f"Task {task_id} not found")
-            
-        if not task.future:
-            raise ValueError(f"Task {task_id} has no future")
-            
-        try:
-            result = await asyncio.wait_for(task.future, timeout=timeout)
-            return result
-        except asyncio.TimeoutError:
-            raise TimeoutError(f"Task {task_id} timed out after {timeout} seconds")
-    
-    async def get_task_status(self, task_id: str) -> Dict[str, Any]:
-        """Get the status of a task by ID"""
-        async with self._lock:
-            task = self.active_tasks.get(task_id) or self.completed_tasks.get(task_id)
-            
-        if not task:
-            raise ValueError(f"Task {task_id} not found")
-            
-        return {
-            "task_id": task_id,
-            "status": task.status,
-            "created_at": task.created_at,
-            "started_at": task.started_at,
-            "completed_at": task.completed_at,
-            "error": str(task.error) if task.error else None
-        }
-    
-    async def get_queue_stats(self) -> Dict[str, Any]:
-        """Get queue statistics"""
-        async with self._lock:
-            return {
-                "queue_size": self.queue.qsize(),
-                "max_queue_size": self.max_queue_size,
-                "active_tasks": len(self.active_tasks),
-                "completed_tasks": len(self.completed_tasks),
-                "max_concurrent": self.max_concurrent,
-                "running": self.running
-            }
-    
-    async def _worker(self, worker_name: str):
-        """Worker coroutine that processes tasks from the queue"""
-        logger.info(f"Worker {worker_name} started")
-        
-        while self.running:
-            try:
-                # Get task from queue with timeout
-                task = await asyncio.wait_for(self.queue.get(), timeout=1.0)
-                
-                logger.debug(f"Worker {worker_name} processing task {task.task_id}")
-                
-                # Use semaphore to limit concurrent execution
-                async with self._semaphore:
-                    # Update task status
-                    task.status = TaskStatus.PROCESSING
-                    task.started_at = time.time()
-                    
-                    try:
-                        # Execute the task
-                        if asyncio.iscoroutinefunction(task.func):
-                            result = await task.func(*task.args, **task.kwargs)
-                        else:
-                            result = task.func(*task.args, **task.kwargs)
-                        
-                        # Task completed successfully
-                        task.result = result
-                        task.status = TaskStatus.COMPLETED
-                        task.completed_at = time.time()
-                        
-                        if task.future and not task.future.done():
-                            task.future.set_result(result)
-                            
-                        logger.debug(f"Task {task.task_id} completed successfully")
-                        
-                    except Exception as e:
-                        # Task failed
-                        task.error = e
-                        task.status = TaskStatus.FAILED
-                        task.completed_at = time.time()
-                        
-                        if task.future and not task.future.done():
-                            task.future.set_exception(e)
-                            
-                        logger.error(f"Task {task.task_id} failed: {e}")
-                    
-                    finally:
-                        # Move task from active to completed
-                        async with self._lock:
-                            if task.task_id in self.active_tasks:
-                                self.completed_tasks[task.task_id] = self.active_tasks.pop(task.task_id)
-                        
-                        # Mark task as done in queue
-                        self.queue.task_done()
-                    
-            except asyncio.TimeoutError:
-                # No task available, continue
-                continue
-            except asyncio.CancelledError:
-                logger.info(f"Worker {worker_name} cancelled")
-                break
-            except Exception as e:
-                logger.error(f"Worker {worker_name} error: {e}")
-                
-        logger.info(f"Worker {worker_name} stopped")
 
 # Configuration
 @dataclass
@@ -235,7 +46,6 @@ class Config:
     hf_token: str = os.getenv("HF_TOKEN", "")
     model_id: str = os.getenv("MODEL_ID", "FLUX.1-dev-NSFW")
     lora_file_name: str = os.getenv("LORA_FILE_NAME", "NSFW_master.safetensors")
-    lora_local_path: str = os.getenv("LORA_LOCAL_PATH", "NSFW_master.safetensors")
     lora_repo: str = os.getenv("LORA_REPO", "NikolaSigmoid/FLUX.1-dev-NSFW-Master")
     flux_dev_repo: str = os.getenv("FLUX_DEV_REPO", "black-forest-labs/FLUX.1-dev")
     max_queue_size: int = int(os.getenv("MAX_QUEUE_SIZE", "100"))
@@ -249,23 +59,381 @@ class Config:
 
 config = Config()
 
+# Configure logging
+logging.basicConfig(level=getattr(logging, config.log_level.upper()))
+logger = logging.getLogger(__name__)
+
+@dataclass
+class QueuedTask:
+    """Represents a task in the priority queue"""
+    task_id: str
+    request: ImageGenerationRequest
+    created_at: datetime
+    priority: int = field(default=1)  # Lower number = higher priority
+    
+    def __lt__(self, other):
+        # First compare by priority, then by creation time for FIFO within same priority
+        if self.priority != other.priority:
+            return self.priority < other.priority
+        return self.created_at < other.created_at
+
+class ProductionQueueManager:
+    """Production-ready queue manager with concurrency control"""
+    
+    def __init__(self, max_queue_size: int = 100, max_concurrent: int = 1):
+        self.max_queue_size = max_queue_size
+        self.max_concurrent = max_concurrent
+        
+        # Semaphore to control concurrent processing
+        self.processing_semaphore = asyncio.Semaphore(max_concurrent)
+        
+        # Priority queue for tasks
+        self.task_queue: list[QueuedTask] = []
+        self.queue_lock = asyncio.Lock()
+        
+        # Task tracking
+        self.tasks: Dict[str, TaskInfo] = {}
+        self.task_results: Dict[str, Any] = {}
+        self.task_errors: Dict[str, ImageGenerationErrorResponse] = {}
+        
+        # Statistics
+        self.stats = {
+            'total_queued': 0,
+            'total_processed': 0,
+            'total_completed': 0,
+            'total_failed': 0,
+            'processing_times': []
+        }
+        
+        # Background tasks
+        self.cleanup_task: Optional[asyncio.Task] = None
+        self.processor_task: Optional[asyncio.Task] = None
+        
+    async def start(self):
+        """Start the queue manager"""
+        logger.info("Starting production queue manager...")
+        self.processor_task = asyncio.create_task(self._process_queue())
+        self.cleanup_task = asyncio.create_task(self._cleanup_expired_tasks())
+        
+    async def stop(self):
+        """Stop the queue manager"""
+        logger.info("Stopping production queue manager...")
+        
+        if self.processor_task:
+            self.processor_task.cancel()
+            try:
+                await self.processor_task
+            except asyncio.CancelledError:
+                pass
+                
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
+            try:
+                await self.cleanup_task
+            except asyncio.CancelledError:
+                pass
+    
+    def _get_priority_value(self, priority: Priority) -> int:
+        """Convert priority enum to numeric value"""
+        priority_map = {
+            Priority.HIGH: 0,
+            Priority.NORMAL: 1,
+            Priority.LOW: 2
+        }
+        return priority_map.get(priority, 1)
+    
+    async def add_task(self, task_id: str, request: ImageGenerationRequest) -> int:
+        """Add a task to the queue and return queue position"""
+        async with self.queue_lock:
+            # Check if queue is full
+            if len(self.task_queue) >= self.max_queue_size:
+                raise HTTPException(
+                    status_code=503, 
+                    detail=f"Queue is full. Maximum {self.max_queue_size} tasks allowed."
+                )
+            
+            # Create queued task
+            queued_task = QueuedTask(
+                task_id=task_id,
+                request=request,
+                created_at=datetime.now(),
+                priority=self._get_priority_value(request.priority or Priority.NORMAL)
+            )
+            
+            # Add to priority queue
+            heapq.heappush(self.task_queue, queued_task)
+            
+            # Create task info
+            self.tasks[task_id] = TaskInfo(
+                task_id=task_id,
+                status=TaskStatus.QUEUED,
+                progress=0.0,
+                created_at=datetime.now(),
+                priority=request.priority or Priority.NORMAL,
+                queue_position=self._get_queue_position(task_id)
+            )
+            
+            self.stats['total_queued'] += 1
+            logger.info(f"Added task {task_id} to queue (priority: {request.priority})")
+            
+            return len(self.task_queue)
+    
+    def _get_queue_position(self, task_id: str) -> int:
+        """Get the current position of a task in the queue"""
+        for i, task in enumerate(sorted(self.task_queue)):
+            if task.task_id == task_id:
+                return i + 1
+        return -1
+    
+    async def get_task_status(self, task_id: str) -> Optional[TaskStatusResponse]:
+        """Get the status of a task"""
+        task_info = self.tasks.get(task_id)
+        if not task_info:
+            return None
+            
+        # Update queue position if still queued
+        if task_info.status == TaskStatus.QUEUED:
+            task_info.queue_position = self._get_queue_position(task_id)
+            # Estimate completion time
+            if task_info.queue_position > 0:
+                avg_time = self._get_average_processing_time()
+                if avg_time:
+                    task_info.estimated_completion = datetime.now() + timedelta(
+                        seconds=avg_time * task_info.queue_position
+                    )
+        
+        return TaskStatusResponse(
+            task_id=task_info.task_id,
+            status=task_info.status,
+            progress=task_info.progress,
+            created_at=task_info.created_at,
+            started_at=task_info.started_at,
+            completed_at=task_info.completed_at,
+            queue_position=task_info.queue_position,
+            estimated_completion=task_info.estimated_completion,
+            error=self.task_errors.get(task_id, {}).get('error') if task_id in self.task_errors else None
+        )
+    
+    async def get_task_result(self, task_id: str) -> Optional[Any]:
+        """Get the result of a completed task"""
+        return self.task_results.get(task_id)
+    
+    def get_queue_stats(self) -> QueueStats:
+        """Get current queue statistics"""
+        processing_count = sum(1 for task in self.tasks.values() if task.status == TaskStatus.PROCESSING)
+        completed_count = sum(1 for task in self.tasks.values() if task.status == TaskStatus.COMPLETED)
+        failed_count = sum(1 for task in self.tasks.values() if task.status == TaskStatus.FAILED)
+        
+        return QueueStats(
+            total_queued=len(self.task_queue),
+            total_processing=processing_count,
+            total_completed=completed_count,
+            total_failed=failed_count,
+            queue_size=len(self.task_queue),
+            max_queue_size=self.max_queue_size,
+            average_processing_time=self._get_average_processing_time(),
+            estimated_wait_time=self._get_estimated_wait_time()
+        )
+    
+    def _get_average_processing_time(self) -> Optional[float]:
+        """Calculate average processing time"""
+        if not self.stats['processing_times']:
+            return None
+        return sum(self.stats['processing_times']) / len(self.stats['processing_times'])
+    
+    def _get_estimated_wait_time(self) -> Optional[float]:
+        """Estimate wait time for new tasks"""
+        avg_time = self._get_average_processing_time()
+        if avg_time and len(self.task_queue) > 0:
+            return avg_time * len(self.task_queue)
+        return None
+    
+    async def _process_queue(self):
+        """Main queue processing loop"""
+        logger.info("Starting queue processor...")
+        
+        while True:
+            try:
+                # Get next task
+                queued_task = None
+                async with self.queue_lock:
+                    if self.task_queue:
+                        queued_task = heapq.heappop(self.task_queue)
+                
+                if queued_task:
+                    # Acquire semaphore to limit concurrent processing
+                    async with self.processing_semaphore:
+                        await self._process_task(queued_task)
+                else:
+                    # No tasks to process, wait a bit
+                    await asyncio.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Error in queue processor: {e}")
+                await asyncio.sleep(5)
+    
+    async def _process_task(self, queued_task: QueuedTask):
+        """Process a single task"""
+        task_id = queued_task.task_id
+        start_time = time.time()
+        
+        try:
+            # Update task status
+            task_info = self.tasks[task_id]
+            task_info.status = TaskStatus.PROCESSING
+            task_info.started_at = datetime.now()
+            task_info.progress = 0.1
+            
+            logger.info(f"Processing task {task_id} (priority: {queued_task.priority})")
+            
+            # Generate image
+            result = await generate_image(queued_task.request, task_id, task_info)
+            
+            # Store result
+            self.task_results[task_id] = result
+            task_info.status = TaskStatus.COMPLETED
+            task_info.completed_at = datetime.now()
+            task_info.progress = 1.0
+            
+            # Update stats
+            processing_time = time.time() - start_time
+            self.stats['processing_times'].append(processing_time)
+            if len(self.stats['processing_times']) > 100:  # Keep only last 100 times
+                self.stats['processing_times'] = self.stats['processing_times'][-100:]
+            
+            self.stats['total_processed'] += 1
+            self.stats['total_completed'] += 1
+            
+            logger.info(f"Completed task {task_id} in {processing_time:.2f}s")
+            
+        except Exception as e:
+            logger.error(f"Error processing task {task_id}: {e}")
+            
+            # Create error response
+            error_response = ImageGenerationErrorResponse(
+                created=int(time.time()),
+                error=ImageGenerationError(
+                    code="generation_error",
+                    message=f"Failed to generate image: {str(e)}",
+                    type="processing_error"
+                )
+            )
+            
+            self.task_errors[task_id] = error_response
+            task_info = self.tasks[task_id]
+            task_info.status = TaskStatus.FAILED
+            task_info.completed_at = datetime.now()
+            
+            self.stats['total_processed'] += 1
+            self.stats['total_failed'] += 1
+    
+    async def _cleanup_expired_tasks(self):
+        """Clean up expired tasks periodically"""
+        while True:
+            try:
+                current_time = datetime.now()
+                expired_tasks = []
+                
+                # Find expired tasks (older than configured TTL)
+                for task_id, task_info in self.tasks.items():
+                    if (current_time - task_info.created_at).total_seconds() > config.task_ttl:
+                        expired_tasks.append(task_id)
+                
+                # Clean up expired tasks
+                for task_id in expired_tasks:
+                    logger.info(f"Cleaning up expired task {task_id}")
+                    self.tasks.pop(task_id, None)
+                    self.task_results.pop(task_id, None)
+                    self.task_errors.pop(task_id, None)
+                
+                # Sleep for configured cleanup interval
+                await asyncio.sleep(config.cleanup_interval)
+                
+            except Exception as e:
+                logger.error(f"Error in cleanup task: {e}")
+                await asyncio.sleep(60)
+
+# Global variables
+pipeline = None
+queue_manager: Optional[ProductionQueueManager] = None
+
 async def initialize_pipeline():
     """Initialize the FLUX.1-Krea-dev image generation pipeline"""
     global pipeline
     try:
         logger.info(f"Downloading {config.flux_dev_repo}...")
-        hf_hub_download(repo_id=config.flux_dev_repo)
+        snapshot_download(repo_id=config.flux_dev_repo)
         logger.info(f"Downloading {config.lora_file_name}...")
-        hf_hub_download(repo_id=config.lora_repo, filename=config.lora_file_name, local_dir=Path.cwd())
-        lora_path = Path.cwd() / config.lora_file_name
-        pipeline = FluxPipeline.from_pretrained(config.model_id, torch_dtype=torch.bfloat16, token = config.hf_token).to("cpu")
-        pipeline.load_lora(lora_path)
+        path = hf_hub_download(repo_id=config.lora_repo, filename=config.lora_file_name)
+        pipeline = FluxPipeline.from_pretrained(config.flux_dev_repo, torch_dtype=torch.bfloat16, token = config.hf_token).to("cpu")
+        pipeline.load_lora_weights(path)
+
         offload.profile(pipeline, profile_type.HighRAM_HighVRAM)
         
         logger.info("Pipeline initialized successfully")
     except Exception as e:
         logger.error(f"Failed to initialize pipeline: {e}")
         raise e
+
+def parse_image_size(size: ImageSize) -> tuple:
+    """Parse image size string to width, height tuple"""
+    width, height = map(int, size.value.split('x'))
+    return width, height
+
+def image_to_base64(image: Image.Image) -> str:
+    """Convert PIL image to base64 string"""
+    buffer = io.BytesIO()
+    image.save(buffer, format='PNG')
+    buffer.seek(0)
+    return base64.b64encode(buffer.read()).decode('utf-8')
+
+async def generate_image(request_data: ImageGenerationRequest, task_id: str, task_info: TaskInfo) -> str:
+    """Generate image using the pipeline"""
+    logger.info(f"Starting image generation for task {task_id}")
+    
+    # Set default negative prompt if not provided
+    # negative_prompt = request_data.negative_prompt or None
+    
+    # Parse image size
+    width, height = parse_image_size(request_data.size)
+    
+    # Set number of inference steps
+    num_steps = request_data.steps or 28
+    prompt = request_data.prompt
+        
+    # Generate image in thread pool to avoid blocking the event loop
+    def _run_pipeline():
+        with torch.no_grad():
+            return pipeline(
+                prompt=prompt,
+                num_inference_steps=num_steps,
+                width=width,
+                height=height,
+                guidance_scale=3.5,
+                generator=torch.Generator().manual_seed(int(time.time()))
+            )
+    
+    # Run the pipeline in a thread pool to keep the event loop responsive
+    loop = asyncio.get_event_loop()
+    result = await loop.run_in_executor(None, _run_pipeline)
+        
+    task_info.progress = 0.8
+        
+    # Get the generated image
+    generated_image = result.images[0]
+    
+    # Convert to base64
+    image_b64 = image_to_base64(generated_image)
+    
+    # Clean up GPU memory
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
+    # Clean up result to free memory
+    del result
+    del generated_image
+    
+    return image_b64
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -294,16 +462,89 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="OpenAI-Compatible Image Generation API",
-    description="A FastAPI-based image generation API compatible with OpenAI's DALL-E API using NVIDIA Cosmos",
+    title="Image Generation API",
+    description="A FastAPI-based image generation API",
     version="1.0.0",
     lifespan=lifespan
 )
 
+@app.post("/images/generations")
+@app.post("/v1/images/generations")
+async def create_image(request: ImageGenerationRequest) -> StreamingResponse:
+    async def fake_stream_generator():
+        task_id = str(uuid.uuid4())
+
+        # add to queue
+        queue_position = await queue_manager.add_task(task_id, request)
+        logger.info(f"Added task {task_id} to queue at position {queue_position}")
+        
+        while True:
+            task_status = await queue_manager.get_task_status(task_id)
+            print(task_status)
+            if task_status.status == TaskStatus.COMPLETED:
+                result = await queue_manager.get_task_result(task_id)
+                chunk = ImageChunk(
+                    content=result,
+                    finish_reason="stop"
+                )
+                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+                yield "data: [DONE]\n\n"
+                return
+            elif task_status.status == TaskStatus.FAILED:
+                error_chunk = ImageChunk(
+                    content=task_status.error.message,
+                    finish_reason="stop"
+                )
+                yield f"data: {json.dumps(error_chunk.model_dump())}\n\n"
+                yield "data: [DONE]\n\n"
+                break
+            elif task_status.status == TaskStatus.QUEUED:
+                queued_chunk = ImageChunk(
+                    content="Still queued..."
+                )
+                yield f"data: {json.dumps(queued_chunk.model_dump())}\n\n"
+                await asyncio.sleep(1)
+            else:
+                processing_chunk = ImageChunk(
+                    content="Still processing..."
+                )
+                yield f"data: {json.dumps(processing_chunk.model_dump())}\n\n"
+                await asyncio.sleep(1)
+        
+    return StreamingResponse(fake_stream_generator(), media_type="application/json")
+            
+
+@app.get("/v1/images/status/{task_id}", response_model=TaskStatusResponse)
+async def get_task_status(task_id: str):
+    """Get the status of an image generation task"""
+    if not queue_manager:
+        raise HTTPException(status_code=503, detail="Queue manager not initialized")
+    
+    task_status = await queue_manager.get_task_status(task_id)
+    
+    if not task_status:
+        raise HTTPException(status_code=404, detail="Task not found")
+    
+    return task_status
+
 @app.get("/health")
 async def health_check():
-    """Health check endpoint with provider details."""
     return {"status": "ok"}
+
+@app.get("/v1/models")
+async def list_models():
+    """List available models (OpenAI compatible)"""
+    return {
+        "object": "list",
+        "data": [
+            {
+                "id": config.model_id,
+                "object": "model",
+                "created": int(time.time()),
+                "owned_by": "eternalai"
+            }
+        ]
+    }
 
 if __name__ == "__main__":
     import uvicorn
