@@ -25,7 +25,6 @@ from huggingface_hub import hf_hub_download, snapshot_download
 
 from schema import (
     ImageGenerationRequest, 
-    ImageData, 
     ImageGenerationError, 
     ImageGenerationErrorResponse,
     ImageSize,
@@ -480,7 +479,6 @@ async def create_image(request: ImageGenerationRequest) -> StreamingResponse:
         
         while True:
             task_status = await queue_manager.get_task_status(task_id)
-            print(task_status)
             if task_status.status == TaskStatus.COMPLETED:
                 result = await queue_manager.get_task_result(task_id)
                 chunk = ImageChunk(
