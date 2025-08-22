@@ -1,6 +1,6 @@
 from enum import Enum
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, Union, Literal
 from pydantic import BaseModel, Field
 
 
@@ -29,9 +29,10 @@ class ImageGenerationRequest(BaseModel):
     priority: Optional[Priority] = Field(default=Priority.NORMAL, description="Task priority in queue")
 
 class ImageChunk(BaseModel):
-    """Image configuration"""
-    content: str = Field(..., description="The content of the image")
-    finish_reason: str = Field(default=None, description="The reason the generation finished")
+    """Individual image data in the response"""
+    content: Optional[str] = Field(None, description="The content of the chunk")
+    image_base64: Optional[str] = Field(None, description="The base64-encoded image data")
+    finish_reason: Union[Literal["stop", "error"], None] = Field(None, description="The finish reason of the chunk")
 
 class ImageData(BaseModel):
     """Individual image data in the response"""

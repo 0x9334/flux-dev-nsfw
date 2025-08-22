@@ -21,8 +21,6 @@ from mmgp import offload, profile_type
 from fastapi.responses import StreamingResponse
 from huggingface_hub import hf_hub_download, snapshot_download
 
-
-
 from schema import (
     ImageGenerationRequest, 
     ImageGenerationError, 
@@ -37,6 +35,8 @@ from schema import (
 )
 
 load_dotenv()
+
+MAX_IMAGE_CHUNK_SIZE = 512
 
 # Configuration
 @dataclass
@@ -481,17 +481,20 @@ async def create_image(request: ImageGenerationRequest) -> StreamingResponse:
             task_status = await queue_manager.get_task_status(task_id)
             if task_status.status == TaskStatus.COMPLETED:
                 result = await queue_manager.get_task_result(task_id)
-                chunk = ImageChunk(
-                    content=result,
-                    finish_reason="stop"
-                )
-                yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+                # split result into many small chunks for streaming
+                is_final_chunk = False
+                for i in range(0, len(result), MAX_IMAGE_CHUNK_SIZE):
+                    is_final_chunk = i + MAX_IMAGE_CHUNK_SIZE >= len(result)
+                    chunk = ImageChunk(
+                        image_base64=result[i : i+ MAX_IMAGE_CHUNK_SIZE],
+                        finish_reason="stop" if is_final_chunk else None
+                    )
+                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
                 yield "data: [DONE]\n\n"
-                return
             elif task_status.status == TaskStatus.FAILED:
                 error_chunk = ImageChunk(
                     content=task_status.error.message,
-                    finish_reason="stop"
+                    finish_reason="error"
                 )
                 yield f"data: {json.dumps(error_chunk.model_dump())}\n\n"
                 yield "data: [DONE]\n\n"
@@ -508,7 +511,6 @@ async def create_image(request: ImageGenerationRequest) -> StreamingResponse:
                 )
                 yield f"data: {json.dumps(processing_chunk.model_dump())}\n\n"
                 await asyncio.sleep(1)
-        
     return StreamingResponse(fake_stream_generator(), media_type="application/json")
             
 
