@@ -523,8 +523,15 @@ async def create_image(request: ImageGenerationRequest) -> StreamingResponse:
                 processing_json = await asyncio.to_thread(json.dumps, processing_chunk.model_dump())
                 yield f"data: {processing_json}\n\n"
                 await asyncio.sleep(1)
-    return StreamingResponse(fake_stream_generator(), media_type="application/json")
-            
+    
+    return StreamingResponse(fake_stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
 @app.get("/v1/images/status/{task_id}", response_model=TaskStatusResponse)
 async def get_task_status(task_id: str):
