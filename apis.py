@@ -489,27 +489,39 @@ async def create_image(request: ImageGenerationRequest) -> StreamingResponse:
                         image_base64=result[i : i+ MAX_IMAGE_CHUNK_SIZE],
                         finish_reason="stop" if is_final_chunk else None
                     )
-                    yield f"data: {json.dumps(chunk.model_dump())}\n\n"
+                    # Use asyncio.to_thread for JSON serialization to avoid blocking
+                    chunk_json = await asyncio.to_thread(json.dumps, chunk.model_dump())
+                    yield f"data: {chunk_json}\n\n"
+                    # Yield control back to event loop periodically
+                    if i % (MAX_IMAGE_CHUNK_SIZE * 10) == 0:
+                        await asyncio.sleep(0)
                 yield "data: [DONE]\n\n"
+                break  # Add missing break statement
             elif task_status.status == TaskStatus.FAILED:
                 error_chunk = ImageChunk(
                     content=task_status.error.message,
                     finish_reason="error"
                 )
-                yield f"data: {json.dumps(error_chunk.model_dump())}\n\n"
+                # Use asyncio.to_thread for JSON serialization
+                error_json = await asyncio.to_thread(json.dumps, error_chunk.model_dump())
+                yield f"data: {error_json}\n\n"
                 yield "data: [DONE]\n\n"
                 break
             elif task_status.status == TaskStatus.QUEUED:
                 queued_chunk = ImageChunk(
                     content="Still queued..."
                 )
-                yield f"data: {json.dumps(queued_chunk.model_dump())}\n\n"
+                # Use asyncio.to_thread for JSON serialization
+                queued_json = await asyncio.to_thread(json.dumps, queued_chunk.model_dump())
+                yield f"data: {queued_json}\n\n"
                 await asyncio.sleep(1)
             else:
                 processing_chunk = ImageChunk(
                     content="Still processing..."
                 )
-                yield f"data: {json.dumps(processing_chunk.model_dump())}\n\n"
+                # Use asyncio.to_thread for JSON serialization
+                processing_json = await asyncio.to_thread(json.dumps, processing_chunk.model_dump())
+                yield f"data: {processing_json}\n\n"
                 await asyncio.sleep(1)
     return StreamingResponse(fake_stream_generator(), media_type="application/json")
             
