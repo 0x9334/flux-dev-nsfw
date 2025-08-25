@@ -472,57 +472,91 @@ app = FastAPI(
 async def create_image(request: ImageGenerationRequest) -> StreamingResponse:
     async def fake_stream_generator():
         task_id = str(uuid.uuid4())
+        start_time = time.time()
+        max_wait_time = 300  # 5 minutes timeout
 
-        # add to queue
-        queue_position = await queue_manager.add_task(task_id, request)
-        logger.info(f"Added task {task_id} to queue at position {queue_position}")
-        
-        while True:
-            task_status = await queue_manager.get_task_status(task_id)
-            if task_status.status == TaskStatus.COMPLETED:
-                result = await queue_manager.get_task_result(task_id)
-                # split result into many small chunks for streaming
-                is_final_chunk = False
-                for i in range(0, len(result), MAX_IMAGE_CHUNK_SIZE):
-                    is_final_chunk = i + MAX_IMAGE_CHUNK_SIZE >= len(result)
-                    chunk = ImageChunk(
-                        image_base64=result[i : i+ MAX_IMAGE_CHUNK_SIZE],
-                        finish_reason="stop" if is_final_chunk else None
+        try:
+            # add to queue
+            queue_position = await queue_manager.add_task(task_id, request)
+            logger.info(f"Added task {task_id} to queue at position {queue_position}")
+            
+            while True:
+                # Check for timeout
+                if time.time() - start_time > max_wait_time:
+                    timeout_chunk = ImageChunk(
+                        content="Request timed out after 5 minutes",
+                        finish_reason="error"
                     )
-                    # Use asyncio.to_thread for JSON serialization to avoid blocking
-                    chunk_json = await asyncio.to_thread(json.dumps, chunk.model_dump())
-                    yield f"data: {chunk_json}\n\n"
-                    # Yield control back to event loop periodically
-                    if i % (MAX_IMAGE_CHUNK_SIZE * 10) == 0:
-                        await asyncio.sleep(0)
-                yield "data: [DONE]\n\n"
-                break  # Add missing break statement
-            elif task_status.status == TaskStatus.FAILED:
-                error_chunk = ImageChunk(
-                    content=task_status.error.message,
-                    finish_reason="error"
-                )
-                # Use asyncio.to_thread for JSON serialization
-                error_json = await asyncio.to_thread(json.dumps, error_chunk.model_dump())
-                yield f"data: {error_json}\n\n"
-                yield "data: [DONE]\n\n"
-                break
-            elif task_status.status == TaskStatus.QUEUED:
-                queued_chunk = ImageChunk(
-                    content="Still queued..."
-                )
-                # Use asyncio.to_thread for JSON serialization
-                queued_json = await asyncio.to_thread(json.dumps, queued_chunk.model_dump())
-                yield f"data: {queued_json}\n\n"
-                await asyncio.sleep(1)
-            else:
-                processing_chunk = ImageChunk(
-                    content="Still processing..."
-                )
-                # Use asyncio.to_thread for JSON serialization
-                processing_json = await asyncio.to_thread(json.dumps, processing_chunk.model_dump())
-                yield f"data: {processing_json}\n\n"
-                await asyncio.sleep(1)
+                    timeout_json = await asyncio.to_thread(json.dumps, timeout_chunk.model_dump())
+                    yield f"data: {timeout_json}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+
+                try:
+                    task_status = await queue_manager.get_task_status(task_id)
+                    if task_status.status == TaskStatus.COMPLETED:
+                        result = await queue_manager.get_task_result(task_id)
+                        # split result into many small chunks for streaming
+                        is_final_chunk = False
+                        for i in range(0, len(result), MAX_IMAGE_CHUNK_SIZE):
+                            is_final_chunk = i + MAX_IMAGE_CHUNK_SIZE >= len(result)
+                            chunk = ImageChunk(
+                                image_base64=result[i : i+ MAX_IMAGE_CHUNK_SIZE],
+                                finish_reason="stop" if is_final_chunk else None
+                            )
+                            # Use asyncio.to_thread for JSON serialization to avoid blocking
+                            chunk_json = await asyncio.to_thread(json.dumps, chunk.model_dump())
+                            yield f"data: {chunk_json}\n\n"
+                            # Yield control back to event loop periodically
+                            if i % (MAX_IMAGE_CHUNK_SIZE * 10) == 0:
+                                await asyncio.sleep(0)
+                        yield "data: [DONE]\n\n"
+                        break
+                    elif task_status.status == TaskStatus.FAILED:
+                        error_chunk = ImageChunk(
+                            content=task_status.error.message,
+                            finish_reason="error"
+                        )
+                        # Use asyncio.to_thread for JSON serialization
+                        error_json = await asyncio.to_thread(json.dumps, error_chunk.model_dump())
+                        yield f"data: {error_json}\n\n"
+                        yield "data: [DONE]\n\n"
+                        break
+                    elif task_status.status == TaskStatus.QUEUED:
+                        queued_chunk = ImageChunk(
+                            content="Still queued..."
+                        )
+                        # Use asyncio.to_thread for JSON serialization
+                        queued_json = await asyncio.to_thread(json.dumps, queued_chunk.model_dump())
+                        yield f"data: {queued_json}\n\n"
+                        await asyncio.sleep(1)
+                    else:
+                        processing_chunk = ImageChunk(
+                            content="Still processing..."
+                        )
+                        # Use asyncio.to_thread for JSON serialization
+                        processing_json = await asyncio.to_thread(json.dumps, processing_chunk.model_dump())
+                        yield f"data: {processing_json}\n\n"
+                        await asyncio.sleep(1)
+                except Exception as e:
+                    logger.error(f"Error processing task {task_id}: {e}")
+                    error_chunk = ImageChunk(
+                        content=f"Internal error: {str(e)}",
+                        finish_reason="error"
+                    )
+                    error_json = await asyncio.to_thread(json.dumps, error_chunk.model_dump())
+                    yield f"data: {error_json}\n\n"
+                    yield "data: [DONE]\n\n"
+                    break
+        except Exception as e:
+            logger.error(f"Error in stream generator for task {task_id}: {e}")
+            error_chunk = ImageChunk(
+                content=f"Stream error: {str(e)}",
+                finish_reason="error"
+            )
+            error_json = await asyncio.to_thread(json.dumps, error_chunk.model_dump())
+            yield f"data: {error_json}\n\n"
+            yield "data: [DONE]\n\n"
     
     return StreamingResponse(fake_stream_generator(),
             media_type="text/event-stream",
