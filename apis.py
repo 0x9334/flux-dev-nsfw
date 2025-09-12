@@ -1,11 +1,12 @@
-import asyncio
-import base64
 import io
 import os
 import time
 import uuid
 import json
-from typing import Dict, Any, Optional
+import asyncio
+import base64
+import uvicorn
+from typing import Dict, Any, Optional, List
 from contextlib import asynccontextmanager
 import logging
 from datetime import datetime, timedelta
@@ -13,30 +14,32 @@ from dotenv import load_dotenv
 import heapq
 from dataclasses import dataclass, field
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 import torch
-from diffusers import FluxPipeline
+from diffusers import FluxKontextPipeline
 from PIL import Image
 from mmgp import offload, profile_type
 from fastapi.responses import StreamingResponse
 from huggingface_hub import hf_hub_download, snapshot_download
 
 from schema import (
-    ImageGenerationRequest, 
-    ImageGenerationError, 
-    ImageGenerationErrorResponse,
-    ImageSize,
+    APIError, 
+    APIErrorResponse,
     TaskStatus,
     TaskInfo,
     TaskStatusResponse,
     Priority,
     ImageChunk,
     QueueStats,
+    FailureReason,
+    ImageGenerationRequest,
+    Model,
+    ModelsResponse,
 )
 
 load_dotenv()
 
-MAX_IMAGE_CHUNK_SIZE = 512
+MAX_IMAGE_CHUNK_SIZE = 8192  # Increased for better performance
 
 # Configuration
 @dataclass
@@ -93,7 +96,7 @@ class ProductionQueueManager:
         # Task tracking
         self.tasks: Dict[str, TaskInfo] = {}
         self.task_results: Dict[str, Any] = {}
-        self.task_errors: Dict[str, ImageGenerationErrorResponse] = {}
+        self.task_errors: Dict[str, APIErrorResponse] = {}
         
         # Statistics
         self.stats = {
@@ -103,6 +106,9 @@ class ProductionQueueManager:
             'total_failed': 0,
             'processing_times': []
         }
+        
+        # Failure tracking
+        self.failure_reasons: Dict[str, FailureReason] = {}
         
         # Background tasks
         self.cleanup_task: Optional[asyncio.Task] = None
@@ -210,7 +216,7 @@ class ProductionQueueManager:
             completed_at=task_info.completed_at,
             queue_position=task_info.queue_position,
             estimated_completion=task_info.estimated_completion,
-            error=self.task_errors.get(task_id, {}).get('error') if task_id in self.task_errors else None
+            error=self.task_errors.get(task_id).error if task_id in self.task_errors else None
         )
     
     async def get_task_result(self, task_id: str) -> Optional[Any]:
@@ -231,7 +237,8 @@ class ProductionQueueManager:
             queue_size=len(self.task_queue),
             max_queue_size=self.max_queue_size,
             average_processing_time=self._get_average_processing_time(),
-            estimated_wait_time=self._get_estimated_wait_time()
+            estimated_wait_time=self._get_estimated_wait_time(),
+            failure_reasons=self.get_failure_reasons()
         )
     
     def _get_average_processing_time(self) -> Optional[float]:
@@ -246,6 +253,64 @@ class ProductionQueueManager:
         if avg_time and len(self.task_queue) > 0:
             return avg_time * len(self.task_queue)
         return None
+    
+    def _categorize_error(self, error: Exception) -> tuple[str, str]:
+        """Categorize error and return (error_type, error_message)"""
+        error_str = str(error).lower()
+        error_type = type(error).__name__
+        
+        # Categorize based on error content and type
+        if "out of memory" in error_str or "cuda out of memory" in error_str:
+            return "memory_error", f"GPU/CPU memory exhausted: {str(error)}"
+        elif "timeout" in error_str or isinstance(error, asyncio.TimeoutError):
+            return "timeout_error", f"Operation timed out: {str(error)}"
+        elif "connection" in error_str or "network" in error_str:
+            return "network_error", f"Network connectivity issue: {str(error)}"
+        elif "permission" in error_str or "access" in error_str:
+            return "permission_error", f"File/resource access denied: {str(error)}"
+        elif "invalid" in error_str or "bad" in error_str or isinstance(error, ValueError):
+            return "validation_error", f"Invalid input or parameters: {str(error)}"
+        elif "pipeline" in error_str or "model" in error_str:
+            return "pipeline_error", f"AI model/pipeline error: {str(error)}"
+        elif isinstance(error, FileNotFoundError):
+            return "file_error", f"Required file not found: {str(error)}"
+        elif isinstance(error, ImportError) or isinstance(error, ModuleNotFoundError):
+            return "dependency_error", f"Missing dependency: {str(error)}"
+        else:
+            return "unknown_error", f"Unexpected error ({error_type}): {str(error)}"
+    
+    def _track_failure(self, error: Exception):
+        """Track failure reason for monitoring"""
+        error_type, error_message = self._categorize_error(error)
+        current_time = datetime.now()
+        
+        # Create a key for grouping similar errors
+        error_key = f"{error_type}:{error_message[:100]}"  # Limit message length for grouping
+        
+        if error_key in self.failure_reasons:
+            # Update existing failure reason
+            failure_reason = self.failure_reasons[error_key]
+            failure_reason.count += 1
+            failure_reason.last_occurrence = current_time
+        else:
+            # Create new failure reason
+            self.failure_reasons[error_key] = FailureReason(
+                error_type=error_type,
+                error_message=error_message,
+                count=1,
+                last_occurrence=current_time
+            )
+        
+        logger.error(f"Tracked failure - Type: {error_type}, Message: {error_message}")
+    
+    def get_failure_reasons(self) -> List[FailureReason]:
+        """Get list of failure reasons sorted by count (descending)"""
+        return sorted(self.failure_reasons.values(), key=lambda x: x.count, reverse=True)
+    
+    def clear_failure_statistics(self):
+        """Clear failure statistics (useful for maintenance/reset)"""
+        self.failure_reasons.clear()
+        logger.info("Cleared failure statistics")
     
     async def _process_queue(self):
         """Main queue processing loop"""
@@ -308,12 +373,18 @@ class ProductionQueueManager:
         except Exception as e:
             logger.error(f"Error processing task {task_id}: {e}")
             
+            # Track failure for monitoring
+            self._track_failure(e)
+            
+            # Categorize error for better error response
+            error_type, error_message = self._categorize_error(e)
+            
             # Create error response
-            error_response = ImageGenerationErrorResponse(
+            error_response = APIErrorResponse(
                 created=int(time.time()),
-                error=ImageGenerationError(
-                    code="generation_error",
-                    message=f"Failed to generate image: {str(e)}",
+                error=APIError(
+                    code=error_type,
+                    message=error_message,
                     type="processing_error"
                 )
             )
@@ -363,10 +434,9 @@ async def initialize_pipeline():
         logger.info(f"Downloading {config.flux_dev_repo}...")
         snapshot_download(repo_id=config.flux_dev_repo)
         logger.info(f"Downloading {config.lora_file_name}...")
-        path = hf_hub_download(repo_id=config.lora_repo, filename=config.lora_file_name)
-        pipeline = FluxPipeline.from_pretrained(config.flux_dev_repo, torch_dtype=torch.bfloat16, token = config.hf_token).to("cpu")
-        pipeline.load_lora_weights(path)
-
+        lora_path = hf_hub_download(repo_id=config.lora_repo, filename=config.lora_file_name)
+        pipeline = FluxKontextPipeline.from_pretrained(config.flux_dev_repo, torch_dtype=torch.bfloat16, token = config.hf_token).to("cpu")
+        pipeline.load_lora_weights(lora_path)
         offload.profile(pipeline, profile_type.HighRAM_HighVRAM)
         
         logger.info("Pipeline initialized successfully")
@@ -374,30 +444,20 @@ async def initialize_pipeline():
         logger.error(f"Failed to initialize pipeline: {e}")
         raise e
 
-def parse_image_size(size: ImageSize) -> tuple:
-    """Parse image size string to width, height tuple"""
-    width, height = map(int, size.value.split('x'))
-    return width, height
-
 def image_to_base64(image: Image.Image) -> str:
     """Convert PIL image to base64 string"""
     buffer = io.BytesIO()
-    image.save(buffer, format='PNG')
+    image.save(buffer, format='JPEG', quality=95, optimize=True)
     buffer.seek(0)
     return base64.b64encode(buffer.read()).decode('utf-8')
 
 async def generate_image(request_data: ImageGenerationRequest, task_id: str, task_info: TaskInfo) -> str:
     """Generate image using the pipeline"""
     logger.info(f"Starting image generation for task {task_id}")
-    
-    # Set default negative prompt if not provided
-    # negative_prompt = request_data.negative_prompt or None
-    
-    # Parse image size
-    width, height = parse_image_size(request_data.size)
-    
-    # Set number of inference steps
-    num_steps = request_data.steps or 28
+
+    width, height = 1024, 1024
+    num_steps = 28
+    guidance_scale = 3.5
     prompt = request_data.prompt
         
     # Generate image in thread pool to avoid blocking the event loop
@@ -408,8 +468,8 @@ async def generate_image(request_data: ImageGenerationRequest, task_id: str, tas
                 num_inference_steps=num_steps,
                 width=width,
                 height=height,
-                guidance_scale=3.5,
-                generator=torch.Generator().manual_seed(int(time.time()))
+                guidance_scale=guidance_scale,
+                generator=torch.Generator().manual_seed(42)
             )
     
     # Run the pipeline in a thread pool to keep the event loop responsive
@@ -440,7 +500,7 @@ async def lifespan(app: FastAPI):
     global queue_manager
     
     # Startup
-    logger.info("Starting up the image generation API...")
+    logger.info("Starting up the image edit API...")
     
     # Initialize pipeline
     await initialize_pipeline()
@@ -455,110 +515,151 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
-    logger.info("Shutting down the image generation API...")
+    logger.info("Shutting down the image edit API...")
     if queue_manager:
         await queue_manager.stop()
 
 # Create FastAPI app
 app = FastAPI(
-    title="Image Generation API",
-    description="A FastAPI-based image generation API",
+    title="Image Edit API",
+    description="A FastAPI-based image edit API",
     version="1.0.0",
     lifespan=lifespan
 )
 
-@app.post("/images/generations")
 @app.post("/v1/images/generations")
-async def create_image(request: ImageGenerationRequest) -> StreamingResponse:
-    async def fake_stream_generator():
+@app.post("/images/generations")
+async def create_image_edit(request: ImageGenerationRequest, req: Request) -> StreamingResponse:
+    """Create an image generation"""
+    async def optimized_stream_generator():
         task_id = str(uuid.uuid4())
+        poll_attempt = 0
+        max_poll_time = 600  # 10 minutes timeout
         start_time = time.time()
-        max_wait_time = 300  # 5 minutes timeout
+
+        async def adaptive_sleep(attempt: int, base_delay: float = 0.5):
+            """Exponential backoff with max delay"""
+            delay = min(base_delay * (2 ** min(attempt, 4)), 5.0)  # Max 5 seconds
+            await asyncio.sleep(delay)
+
+        async def send_chunk(chunk_data: dict):
+            """Helper to send chunk with optimized JSON serialization"""
+            chunk_json = json.dumps(chunk_data)  # Direct serialization - fast enough
+            yield f"data: {chunk_json}\n\n"
 
         try:
-            # add to queue
+            # Add to queue
             queue_position = await queue_manager.add_task(task_id, request)
             logger.info(f"Added task {task_id} to queue at position {queue_position}")
             
             while True:
+                # Check for client disconnect
+                if await req.is_disconnected():
+                    logger.info(f"Client disconnected for task {task_id}, cleaning up")
+                    break
+                
                 # Check for timeout
-                if time.time() - start_time > max_wait_time:
-                    timeout_chunk = ImageChunk(
-                        content="Request timed out after 5 minutes",
+                if time.time() - start_time > max_poll_time:
+                    logger.warning(f"Task {task_id} timed out after {max_poll_time} seconds")
+                    async for chunk in send_chunk(ImageChunk(
+                        content="Task timed out",
                         finish_reason="error"
-                    )
-                    timeout_json = await asyncio.to_thread(json.dumps, timeout_chunk.model_dump())
-                    yield f"data: {timeout_json}\n\n"
+                    ).model_dump()):
+                        yield chunk
                     yield "data: [DONE]\n\n"
                     break
 
-                try:
-                    task_status = await queue_manager.get_task_status(task_id)
-                    if task_status.status == TaskStatus.COMPLETED:
-                        result = await queue_manager.get_task_result(task_id)
-                        # split result into many small chunks for streaming
-                        is_final_chunk = False
-                        for i in range(0, len(result), MAX_IMAGE_CHUNK_SIZE):
-                            is_final_chunk = i + MAX_IMAGE_CHUNK_SIZE >= len(result)
-                            chunk = ImageChunk(
-                                image_base64=result[i : i+ MAX_IMAGE_CHUNK_SIZE],
-                                finish_reason="stop" if is_final_chunk else None
-                            )
-                            # Use asyncio.to_thread for JSON serialization to avoid blocking
-                            chunk_json = await asyncio.to_thread(json.dumps, chunk.model_dump())
-                            yield f"data: {chunk_json}\n\n"
-                            # Yield control back to event loop periodically
-                            if i % (MAX_IMAGE_CHUNK_SIZE * 10) == 0:
-                                await asyncio.sleep(0)
-                        yield "data: [DONE]\n\n"
-                        break
-                    elif task_status.status == TaskStatus.FAILED:
-                        error_chunk = ImageChunk(
-                            content=task_status.error.message,
-                            finish_reason="error"
-                        )
-                        # Use asyncio.to_thread for JSON serialization
-                        error_json = await asyncio.to_thread(json.dumps, error_chunk.model_dump())
-                        yield f"data: {error_json}\n\n"
-                        yield "data: [DONE]\n\n"
-                        break
-                    elif task_status.status == TaskStatus.QUEUED:
-                        queued_chunk = ImageChunk(
-                            content="Still queued..."
-                        )
-                        # Use asyncio.to_thread for JSON serialization
-                        queued_json = await asyncio.to_thread(json.dumps, queued_chunk.model_dump())
-                        yield f"data: {queued_json}\n\n"
-                        await asyncio.sleep(1)
-                    else:
-                        processing_chunk = ImageChunk(
-                            content="Still processing..."
-                        )
-                        # Use asyncio.to_thread for JSON serialization
-                        processing_json = await asyncio.to_thread(json.dumps, processing_chunk.model_dump())
-                        yield f"data: {processing_json}\n\n"
-                        await asyncio.sleep(1)
-                except Exception as e:
-                    logger.error(f"Error processing task {task_id}: {e}")
-                    error_chunk = ImageChunk(
-                        content=f"Internal error: {str(e)}",
+                task_status = await queue_manager.get_task_status(task_id)
+                if not task_status:
+                    logger.error(f"Task {task_id} not found")
+                    async for chunk in send_chunk(ImageChunk(
+                        content="Task not found",
                         finish_reason="error"
-                    )
-                    error_json = await asyncio.to_thread(json.dumps, error_chunk.model_dump())
-                    yield f"data: {error_json}\n\n"
+                    ).model_dump()):
+                        yield chunk
                     yield "data: [DONE]\n\n"
                     break
+
+                if task_status.status == TaskStatus.COMPLETED:
+                    result = await queue_manager.get_task_result(task_id)
+                    if not result:
+                        async for chunk in send_chunk(ImageChunk(
+                            content="No result available",
+                            finish_reason="error"
+                        ).model_dump()):
+                            yield chunk
+                        yield "data: [DONE]\n\n"
+                        break
+                    
+                    # Stream result in optimized chunks
+                    result_len = len(result)
+                    for i in range(0, result_len, MAX_IMAGE_CHUNK_SIZE):
+                        # Check disconnect during chunking
+                        if await req.is_disconnected():
+                            logger.info(f"Client disconnected during chunking for task {task_id}")
+                            return
+                            
+                        is_final_chunk = i + MAX_IMAGE_CHUNK_SIZE >= result_len
+                        chunk_data = ImageChunk(
+                            image_base64=result[i:i + MAX_IMAGE_CHUNK_SIZE],
+                            finish_reason="stop" if is_final_chunk else None
+                        ).model_dump()
+                        
+                        async for chunk in send_chunk(chunk_data):
+                            yield chunk
+                        
+                        # Yield control less frequently due to larger chunks
+                        if i % (MAX_IMAGE_CHUNK_SIZE * 5) == 0:
+                            await asyncio.sleep(0)
+                    
+                    yield "data: [DONE]\n\n"
+                    logger.info(f"Successfully streamed result for task {task_id}")
+                    break
+
+                elif task_status.status == TaskStatus.FAILED:
+                    error_msg = task_status.error.message if task_status.error else "Unknown error"
+                    async for chunk in send_chunk(ImageChunk(
+                        content=error_msg,
+                        finish_reason="error"
+                    ).model_dump()):
+                        yield chunk
+                    yield "data: [DONE]\n\n"
+                    break
+
+                elif task_status.status == TaskStatus.QUEUED:
+                    async for chunk in send_chunk(ImageChunk(
+                        content=f"Queued (position: {task_status.queue_position or 'unknown'})"
+                    ).model_dump()):
+                        yield chunk
+                    await adaptive_sleep(poll_attempt)
+
+                else:  # PROCESSING
+                    progress_msg = f"Processing... ({int(task_status.progress * 100)}%)" if task_status.progress else "Processing..."
+                    async for chunk in send_chunk(ImageChunk(
+                        content=progress_msg
+                    ).model_dump()):
+                        yield chunk
+                    await adaptive_sleep(poll_attempt)
+
+                poll_attempt += 1
+
         except Exception as e:
             logger.error(f"Error in stream generator for task {task_id}: {e}")
-            error_chunk = ImageChunk(
-                content=f"Stream error: {str(e)}",
-                finish_reason="error"
-            )
-            error_json = await asyncio.to_thread(json.dumps, error_chunk.model_dump())
-            yield f"data: {error_json}\n\n"
-            yield "data: [DONE]\n\n"
+            try:
+                async for chunk in send_chunk(ImageChunk(
+                    content=f"Stream error: {str(e)}",
+                    finish_reason="error"
+                ).model_dump()):
+                    yield chunk
+                yield "data: [DONE]\n\n"
+            except Exception as cleanup_error:
+                logger.error(f"Error during cleanup for task {task_id}: {cleanup_error}")
+        
+        finally:
+            # Ensure cleanup happens
+            logger.debug(f"Stream generator cleanup for task {task_id}")
     
-    return StreamingResponse(fake_stream_generator(),
+    return StreamingResponse(optimized_stream_generator(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -580,25 +681,42 @@ async def get_task_status(task_id: str):
     
     return task_status
 
-@app.get("/health")
-async def health_check():
+@app.get("/health", response_model=dict)
+async def health_check() -> dict:
     return {"status": "ok"}
 
-@app.get("/v1/models")
-async def list_models():
+@app.get("/v1/queue/stats", response_model=QueueStats)
+async def get_queue_stats() -> QueueStats:
+    """Get the stats of the queue"""
+    if not queue_manager:
+        raise HTTPException(status_code=503, detail="Queue manager not initialized")
+    return queue_manager.get_queue_stats()
+
+@app.get("/v1/queue/failures", response_model=List[FailureReason])
+async def get_failure_details() -> List[FailureReason]:
+    """Get detailed failure information for monitoring"""
+    if not queue_manager:
+        raise HTTPException(status_code=503, detail="Queue manager not initialized")
+    return queue_manager.get_failure_reasons()
+
+@app.post("/v1/queue/failures/clear", response_model=dict)
+async def clear_failure_statistics() -> dict:
+    """Clear failure statistics (maintenance endpoint)"""
+    if not queue_manager:
+        raise HTTPException(status_code=503, detail="Queue manager not initialized")
+    queue_manager.clear_failure_statistics()
+    return {"status": "success", "message": "Failure statistics cleared"}
+
+@app.get("/v1/models", response_model=ModelsResponse)
+async def list_models() -> ModelsResponse:
     """List available models (OpenAI compatible)"""
-    return {
-        "object": "list",
-        "data": [
-            {
-                "id": config.model_id,
-                "object": "model",
-                "created": int(time.time()),
-                "owned_by": "eternalai"
-            }
-        ]
-    }
+    model_card = Model(
+        id=config.model_id,
+        object="model",
+        created=int(time.time()),
+        owned_by="eternalai"
+    )
+    return ModelsResponse(object="list", data=[model_card])
 
 if __name__ == "__main__":
-    import uvicorn
     uvicorn.run(app, host=config.host, port=config.port)

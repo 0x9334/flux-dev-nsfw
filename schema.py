@@ -1,13 +1,9 @@
 from enum import Enum
 from datetime import datetime
-from typing import Optional, Union, Literal
+from typing import Optional, Union, Literal, List
 from pydantic import BaseModel, Field
 
-
 MODEL_ID = "FLUX.1-dev-NSFW"
-
-class ImageSize(str, Enum):
-    FLUX_SIZE = "1024x1024"
 
 class TaskStatus(str, Enum):
     QUEUED = "queued"
@@ -20,13 +16,22 @@ class Priority(str, Enum):
     NORMAL = "normal"
     HIGH = "high"
 
-class ImageGenerationRequest(BaseModel):
-    """Request schema for OpenAI-compatible image generation API"""
-    prompt: str = Field(..., description="A text description of the desired image(s). The maximum length is 1000 characters.", max_length=1000)
-    model: Optional[str] = Field(default=MODEL_ID, description="The model to use for image generation")
-    size: Optional[ImageSize] = Field(default=ImageSize.FLUX_SIZE, description="The size of the generated images")
-    steps: Optional[int] = Field(default=28, ge=1, le=50, description="The number of inference steps (1-50)")
-    priority: Optional[Priority] = Field(default=Priority.NORMAL, description="Task priority in queue")
+class Model(BaseModel):
+    """
+    Represents a model in the models list response.
+    """
+    id: str = Field(..., description="The model ID.")
+    object: str = Field("model", description="The object type, always 'model'.")
+    created: int = Field(..., description="The creation timestamp.")
+    owned_by: str = Field("user", description="The owner of the model.")
+
+class ModelsResponse(BaseModel):
+    """
+    Represents the response for the models list endpoint.
+    """
+    object: str = Field("list", description="The object type, always 'list'.")
+    data: List[Model] = Field(..., description="List of models.")
+
 
 class ImageChunk(BaseModel):
     """Individual image data in the response"""
@@ -34,21 +39,24 @@ class ImageChunk(BaseModel):
     image_base64: Optional[str] = Field(None, description="The base64-encoded image data")
     finish_reason: Union[Literal["stop", "error"], None] = Field(None, description="The finish reason of the chunk")
 
-class ImageData(BaseModel):
-    """Individual image data in the response"""
-    url: Optional[str] = Field(None, description="The URL of the generated image, if response_format is url")
-    b64_json: Optional[str] = Field(None, description="The base64-encoded JSON of the generated image, if response_format is b64_json")
 
-class ImageGenerationError(BaseModel):
+class APIError(BaseModel):
     """Error response schema"""
-    code: str = Field(..., description="Error code (e.g., 'contentFilter', 'generation_error', 'queue_full')")
+    code: str = Field(..., description="Error code (e.g., 'contentFilter', 'processing_error', 'queue_full')")
     message: str = Field(..., description="Human-readable error message")
     type: Optional[str] = Field(None, description="Error type")
 
-class ImageGenerationErrorResponse(BaseModel):
+class APIErrorResponse(BaseModel):
     """Error response wrapper"""
     created: int = Field(..., description="The Unix timestamp (in seconds) when the error occurred")
-    error: ImageGenerationError = Field(..., description="Error details")
+    error: APIError = Field(..., description="Error details")
+
+class FailureReason(BaseModel):
+    """Failure reason details"""
+    error_type: str = Field(..., description="Type of error (e.g., 'pipeline_error', 'memory_error', 'timeout')")
+    error_message: str = Field(..., description="Human-readable error message")
+    count: int = Field(..., description="Number of times this error occurred")
+    last_occurrence: datetime = Field(..., description="When this error last occurred")
 
 class QueueStats(BaseModel):
     """Queue statistics schema"""
@@ -60,6 +68,7 @@ class QueueStats(BaseModel):
     max_queue_size: int = Field(..., description="Maximum queue size")
     average_processing_time: Optional[float] = Field(None, description="Average processing time in seconds")
     estimated_wait_time: Optional[float] = Field(None, description="Estimated wait time for new tasks")
+    failure_reasons: List[FailureReason] = Field(default_factory=list, description="Detailed breakdown of failure reasons")
 
 class TaskInfo(BaseModel):
     """Task information schema"""
@@ -83,4 +92,11 @@ class TaskStatusResponse(BaseModel):
     completed_at: Optional[datetime] = Field(None, description="Task completion timestamp")
     queue_position: Optional[int] = Field(None, description="Current position in queue")
     estimated_completion: Optional[datetime] = Field(None, description="Estimated completion time")
-    error: Optional[ImageGenerationError] = Field(None, description="Error information if task failed")
+    error: Optional[APIError] = Field(None, description="Error information if task failed")
+
+class ImageGenerationRequest(BaseModel):
+    """Request schema for OpenAI-compatible image generation API (for internal processing)"""
+    model: str = Field("flux-kontext-pro", description="The model to use for image editing")
+    prompt: str = Field(..., description="A text description of the desired image. The maximum length is 1000 characters.", max_length=1000)
+    guidance_scale: Optional[float] = Field(default=3.5, description="The guidance scale to use for the image generation.")
+    priority: Optional[Priority] = Field(default=Priority.NORMAL, description="Task priority in queue")
