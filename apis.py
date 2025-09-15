@@ -225,15 +225,14 @@ class ProductionQueueManager:
     
     def get_queue_stats(self) -> QueueStats:
         """Get current queue statistics"""
+        # Use persistent stats for totals to avoid issues with task cleanup
         processing_count = sum(1 for task in self.tasks.values() if task.status == TaskStatus.PROCESSING)
-        completed_count = sum(1 for task in self.tasks.values() if task.status == TaskStatus.COMPLETED)
-        failed_count = sum(1 for task in self.tasks.values() if task.status == TaskStatus.FAILED)
         
         return QueueStats(
-            total_queued=len(self.task_queue),
+            total_queued=self.stats['total_queued'],
             total_processing=processing_count,
-            total_completed=completed_count,
-            total_failed=failed_count,
+            total_completed=self.stats['total_completed'],
+            total_failed=self.stats['total_failed'],
             queue_size=len(self.task_queue),
             max_queue_size=self.max_queue_size,
             average_processing_time=self._get_average_processing_time(),
