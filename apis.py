@@ -499,7 +499,7 @@ async def lifespan(app: FastAPI):
     global queue_manager
     
     # Startup
-    logger.info("Starting up the image edit API...")
+    logger.info("Starting up the image generation API...")
     
     # Initialize pipeline
     await initialize_pipeline()
@@ -514,21 +514,21 @@ async def lifespan(app: FastAPI):
     yield
     
     # Shutdown
-    logger.info("Shutting down the image edit API...")
+    logger.info("Shutting down the image generation API...")
     if queue_manager:
         await queue_manager.stop()
 
 # Create FastAPI app
 app = FastAPI(
-    title="Image Edit API",
-    description="A FastAPI-based image edit API",
+    title="Image Generation API",
+    description="A FastAPI-based image generation API",
     version="1.0.0",
     lifespan=lifespan
 )
 
 @app.post("/v1/images/generations")
 @app.post("/images/generations")
-async def create_image_edit(request: ImageGenerationRequest, req: Request) -> StreamingResponse:
+async def create_image_generation(request: ImageGenerationRequest, req: Request) -> StreamingResponse:
     """Create an image generation"""
     async def optimized_stream_generator():
         task_id = str(uuid.uuid4())

@@ -96,7 +96,7 @@ class TaskStatusResponse(BaseModel):
 
 class ImageGenerationRequest(BaseModel):
     """Request schema for OpenAI-compatible image generation API (for internal processing)"""
-    model: str = Field("flux-kontext-pro", description="The model to use for image editing")
+    model: str = Field(MODEL_ID, description="The model to use for image editing")
     prompt: str = Field(..., description="A text description of the desired image. The maximum length is 1000 characters.", max_length=1000)
     guidance_scale: Optional[float] = Field(default=3.5, description="The guidance scale to use for the image generation.")
     priority: Optional[Priority] = Field(default=Priority.NORMAL, description="Task priority in queue")
