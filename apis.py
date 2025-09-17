@@ -30,6 +30,7 @@ from schema import (
     TaskStatusResponse,
     Priority,
     ImageChunk,
+    ResponseStatus,
     QueueStats,
     FailureReason,
     ImageGenerationRequest,
@@ -79,6 +80,20 @@ class QueuedTask:
             return self.priority < other.priority
         return self.created_at < other.created_at
 
+@dataclass
+class QueuedTask:
+    """Represents a task in the priority queue"""
+    task_id: str
+    request: ImageGenerationRequest
+    created_at: datetime
+    priority: int = field(default=1)  # Lower number = higher priority
+    
+    def __lt__(self, other):
+        # First compare by priority, then by creation time for FIFO within same priority
+        if self.priority != other.priority:
+            return self.priority < other.priority
+        return self.created_at < other.created_at
+
 class ProductionQueueManager:
     """Production-ready queue manager with concurrency control"""
     
@@ -104,6 +119,7 @@ class ProductionQueueManager:
             'total_processed': 0,
             'total_completed': 0,
             'total_failed': 0,
+            'total_dropped': 0,
             'processing_times': []
         }
         
@@ -207,10 +223,16 @@ class ProductionQueueManager:
                         seconds=avg_time * task_info.queue_position
                     )
         
+        # Calculate dynamic progress for processing tasks
+        if task_info.status == TaskStatus.PROCESSING:
+            dynamic_progress = self._calculate_task_progress(task_info)
+        else:
+            dynamic_progress = task_info.progress
+            
         return TaskStatusResponse(
             task_id=task_info.task_id,
             status=task_info.status,
-            progress=task_info.progress,
+            progress=dynamic_progress,
             created_at=task_info.created_at,
             started_at=task_info.started_at,
             completed_at=task_info.completed_at,
@@ -233,6 +255,7 @@ class ProductionQueueManager:
             total_processing=processing_count,
             total_completed=self.stats['total_completed'],
             total_failed=self.stats['total_failed'],
+            total_dropped=self.stats['total_dropped'],
             queue_size=len(self.task_queue),
             max_queue_size=self.max_queue_size,
             average_processing_time=self._get_average_processing_time(),
@@ -245,6 +268,25 @@ class ProductionQueueManager:
         if not self.stats['processing_times']:
             return None
         return sum(self.stats['processing_times']) / len(self.stats['processing_times'])
+    
+    def _calculate_task_progress(self, task_info: TaskInfo) -> float:
+        """Calculate task progress based on processing time vs average processing time"""
+        if task_info.status != TaskStatus.PROCESSING or not task_info.started_at:
+            return 0.0
+            
+        # Calculate how long the task has been processing
+        processing_time = (datetime.now() - task_info.started_at).total_seconds()
+        
+        # Get average processing time
+        avg_time = self._get_average_processing_time()
+        if not avg_time or avg_time <= 0:
+            # Fallback to a simple time-based progress if no average available
+            # Assume tasks typically take 30-60 seconds, cap at 90%
+            return min(processing_time / 45.0, 0.9)
+        
+        # Calculate progress: min(processing_time / average_time, 1.0) * 100
+        progress_ratio = min(processing_time / avg_time, 1.0)
+        return progress_ratio
     
     def _get_estimated_wait_time(self) -> Optional[float]:
         """Estimate wait time for new tasks"""
@@ -341,11 +383,16 @@ class ProductionQueueManager:
         start_time = time.time()
         
         try:
+            # Check if task still exists (might have been cleaned up)
+            task_info = self.tasks.get(task_id)
+            if not task_info:
+                logger.info(f"Task {task_id} was already cleaned up, skipping processing")
+                return
+            
             # Update task status
-            task_info = self.tasks[task_id]
             task_info.status = TaskStatus.PROCESSING
             task_info.started_at = datetime.now()
-            task_info.progress = 0.1
+            # Progress will be calculated dynamically based on processing time
             
             logger.info(f"Processing task {task_id} (priority: {queued_task.priority})")
             
@@ -409,11 +456,27 @@ class ProductionQueueManager:
                         expired_tasks.append(task_id)
                 
                 # Clean up expired tasks
+                async with self.queue_lock:
+                    # Remove expired tasks from task_queue
+                    self.task_queue = [task for task in self.task_queue if task.task_id not in expired_tasks]
+                    heapq.heapify(self.task_queue)  # Rebuild heap after filtering
+                
                 for task_id in expired_tasks:
-                    logger.info(f"Cleaning up expired task {task_id}")
+                    task_info = self.tasks.get(task_id)
+                    if task_info:
+                        age_seconds = (current_time - task_info.created_at).total_seconds()
+                        logger.warning(f"Dropping expired task {task_id} after {age_seconds:.1f} seconds (TTL: {config.task_ttl}s)")
+                    else:
+                        logger.info(f"Cleaning up expired task {task_id}")
+                    
                     self.tasks.pop(task_id, None)
                     self.task_results.pop(task_id, None)
                     self.task_errors.pop(task_id, None)
+                    self.stats['total_dropped'] += 1
+                
+                # Log summary if tasks were dropped
+                if expired_tasks:
+                    logger.info(f"Dropped {len(expired_tasks)} expired tasks (total dropped: {self.stats['total_dropped']})")
                 
                 # Sleep for configured cleanup interval
                 await asyncio.sleep(config.cleanup_interval)
@@ -475,7 +538,7 @@ async def generate_image(request_data: ImageGenerationRequest, task_id: str, tas
     loop = asyncio.get_event_loop()
     result = await loop.run_in_executor(None, _run_pipeline)
         
-    task_info.progress = 0.8
+    # Progress is calculated dynamically based on processing time
         
     # Get the generated image
     generated_image = result.images[0]
@@ -562,6 +625,7 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                     logger.warning(f"Task {task_id} timed out after {max_poll_time} seconds")
                     async for chunk in send_chunk(ImageChunk(
                         content="Task timed out",
+                        status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
                         finish_reason="error"
                     ).model_dump()):
                         yield chunk
@@ -573,6 +637,7 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                     logger.error(f"Task {task_id} not found")
                     async for chunk in send_chunk(ImageChunk(
                         content="Task not found",
+                        status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
                         finish_reason="error"
                     ).model_dump()):
                         yield chunk
@@ -584,6 +649,7 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                     if not result:
                         async for chunk in send_chunk(ImageChunk(
                             content="No result available",
+                            status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
                             finish_reason="error"
                         ).model_dump()):
                             yield chunk
@@ -601,6 +667,7 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                         is_final_chunk = i + MAX_IMAGE_CHUNK_SIZE >= result_len
                         chunk_data = ImageChunk(
                             image_base64=result[i:i + MAX_IMAGE_CHUNK_SIZE],
+                            status=ResponseStatus(status=TaskStatus.COMPLETED, progress=100.0),
                             finish_reason="stop" if is_final_chunk else None
                         ).model_dump()
                         
@@ -619,6 +686,7 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                     error_msg = task_status.error.message if task_status.error else "Unknown error"
                     async for chunk in send_chunk(ImageChunk(
                         content=error_msg,
+                        status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
                         finish_reason="error"
                     ).model_dump()):
                         yield chunk
@@ -627,15 +695,25 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
 
                 elif task_status.status == TaskStatus.QUEUED:
                     async for chunk in send_chunk(ImageChunk(
-                        content=f"Queued (position: {task_status.queue_position or 'unknown'})"
+                        content=f"Queued (position: {task_status.queue_position or 'unknown'})",
+                        status=ResponseStatus(status=TaskStatus.QUEUED, progress=0.0)
                     ).model_dump()):
                         yield chunk
                     await adaptive_sleep(poll_attempt)
 
                 else:  # PROCESSING
-                    progress_msg = f"Processing... ({int(task_status.progress * 100)}%)" if task_status.progress else "Processing..."
+                    # Calculate dynamic progress based on processing time
+                    task_info = queue_manager.tasks.get(task_id)
+                    if task_info:
+                        progress_ratio = queue_manager._calculate_task_progress(task_info)
+                        progress_pct = min(progress_ratio * 100, 100.0)
+                    else:
+                        progress_pct = task_status.progress * 100 if task_status.progress else 0.0
+                    
+                    progress_msg = f"Processing... ({int(progress_pct)}%)" if progress_pct > 0 else "Processing..."
                     async for chunk in send_chunk(ImageChunk(
-                        content=progress_msg
+                        content=progress_msg,
+                        status=ResponseStatus(status=TaskStatus.PROCESSING, progress=progress_pct)
                     ).model_dump()):
                         yield chunk
                     await adaptive_sleep(poll_attempt)
@@ -647,6 +725,7 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
             try:
                 async for chunk in send_chunk(ImageChunk(
                     content=f"Stream error: {str(e)}",
+                    status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
                     finish_reason="error"
                 ).model_dump()):
                     yield chunk

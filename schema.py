@@ -32,11 +32,16 @@ class ModelsResponse(BaseModel):
     object: str = Field("list", description="The object type, always 'list'.")
     data: List[Model] = Field(..., description="List of models.")
 
+class ResponseStatus(BaseModel):
+    """Response status schema"""
+    status: TaskStatus = Field(..., description="The status of the response")
+    progress: float = Field(..., ge=0.0, le=100.0, description="The progress of the response as a percentage (0-100)")
 
 class ImageChunk(BaseModel):
     """Individual image data in the response"""
     content: Optional[str] = Field(None, description="The content of the chunk")
     image_base64: Optional[str] = Field(None, description="The base64-encoded image data")
+    status: ResponseStatus = Field(..., description="The status of the response")
     finish_reason: Union[Literal["stop", "error"], None] = Field(None, description="The finish reason of the chunk")
 
 
@@ -64,6 +69,7 @@ class QueueStats(BaseModel):
     total_processing: int = Field(..., description="Total number of processing tasks")
     total_completed: int = Field(..., description="Total number of completed tasks")
     total_failed: int = Field(..., description="Total number of failed tasks")
+    total_dropped: int = Field(..., description="Total number of dropped tasks (exceeded TTL)")
     queue_size: int = Field(..., description="Current queue size")
     max_queue_size: int = Field(..., description="Maximum queue size")
     average_processing_time: Optional[float] = Field(None, description="Average processing time in seconds")
@@ -96,7 +102,6 @@ class TaskStatusResponse(BaseModel):
 
 class ImageGenerationRequest(BaseModel):
     """Request schema for OpenAI-compatible image generation API (for internal processing)"""
-    model: str = Field(MODEL_ID, description="The model to use for image editing")
+    model: str = Field(MODEL_ID, description="The model to use for image generation")
     prompt: str = Field(..., description="A text description of the desired image. The maximum length is 1000 characters.", max_length=1000)
-    guidance_scale: Optional[float] = Field(default=3.5, description="The guidance scale to use for the image generation.")
     priority: Optional[Priority] = Field(default=Priority.NORMAL, description="Task priority in queue")
