@@ -59,26 +59,15 @@ class Config:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     host: str = os.getenv("HOST", "0.0.0.0")
     port: int = int(os.getenv("PORT", "8000"))
+    default_processing_time: int = int(os.getenv("DEFAULT_PROCESSING_TIME", "25"))
 
 config = Config()
+
+DEFAULT_AVERAGE_PROCESSING_TIME = config.default_processing_time
 
 # Configure logging
 logging.basicConfig(level=getattr(logging, config.log_level.upper()))
 logger = logging.getLogger(__name__)
-
-@dataclass
-class QueuedTask:
-    """Represents a task in the priority queue"""
-    task_id: str
-    request: ImageGenerationRequest
-    created_at: datetime
-    priority: int = field(default=1)  # Lower number = higher priority
-    
-    def __lt__(self, other):
-        # First compare by priority, then by creation time for FIFO within same priority
-        if self.priority != other.priority:
-            return self.priority < other.priority
-        return self.created_at < other.created_at
 
 @dataclass
 class QueuedTask:
@@ -191,7 +180,8 @@ class ProductionQueueManager:
                 progress=0.0,
                 created_at=datetime.now(),
                 priority=request.priority or Priority.NORMAL,
-                queue_position=self._get_queue_position(task_id)
+                queue_position=self._get_queue_position(task_id),
+                total_queue_size=len(self.task_queue)
             )
             
             self.stats['total_queued'] += 1
@@ -215,6 +205,7 @@ class ProductionQueueManager:
         # Update queue position if still queued
         if task_info.status == TaskStatus.QUEUED:
             task_info.queue_position = self._get_queue_position(task_id)
+            task_info.total_queue_size = len(self.task_queue)
             # Estimate completion time
             if task_info.queue_position > 0:
                 avg_time = self._get_average_processing_time()
@@ -237,6 +228,7 @@ class ProductionQueueManager:
             started_at=task_info.started_at,
             completed_at=task_info.completed_at,
             queue_position=task_info.queue_position,
+            total_queue_size=task_info.total_queue_size,
             estimated_completion=task_info.estimated_completion,
             error=self.task_errors.get(task_id).error if task_id in self.task_errors else None
         )
@@ -266,7 +258,7 @@ class ProductionQueueManager:
     def _get_average_processing_time(self) -> Optional[float]:
         """Calculate average processing time"""
         if not self.stats['processing_times']:
-            return None
+            return DEFAULT_AVERAGE_PROCESSING_TIME
         return sum(self.stats['processing_times']) / len(self.stats['processing_times'])
     
     def _calculate_task_progress(self, task_info: TaskInfo) -> float:
@@ -596,7 +588,7 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
     async def optimized_stream_generator():
         task_id = str(uuid.uuid4())
         poll_attempt = 0
-        max_poll_time = 600  # 10 minutes timeout
+        max_poll_time = 1200  # 20 minutes timeout for image generation
         start_time = time.time()
 
         async def adaptive_sleep(attempt: int, base_delay: float = 0.5):
@@ -604,15 +596,16 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
             delay = min(base_delay * (2 ** min(attempt, 4)), 5.0)  # Max 5 seconds
             await asyncio.sleep(delay)
 
-        async def send_chunk(chunk_data: dict):
+        async def send_chunk(chunk_obj):
             """Helper to send chunk with optimized JSON serialization"""
-            chunk_json = json.dumps(chunk_data)  # Direct serialization - fast enough
+            # Use model_dump_json() to properly handle datetime serialization
+            chunk_json = chunk_obj.model_dump_json()
             yield f"data: {chunk_json}\n\n"
 
         try:
             # Add to queue
             queue_position = await queue_manager.add_task(task_id, request)
-            logger.info(f"Added task {task_id} to queue at position {queue_position}")
+            logger.info(f"Added image generation task {task_id} to queue at position {queue_position}")
             
             while True:
                 # Check for client disconnect
@@ -624,10 +617,11 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                 if time.time() - start_time > max_poll_time:
                     logger.warning(f"Task {task_id} timed out after {max_poll_time} seconds")
                     async for chunk in send_chunk(ImageChunk(
+                        id=task_id,
                         content="Task timed out",
-                        status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
+                        status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0, estimated_wait_time=None),
                         finish_reason="error"
-                    ).model_dump()):
+                    )):
                         yield chunk
                     yield "data: [DONE]\n\n"
                     break
@@ -636,10 +630,11 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                 if not task_status:
                     logger.error(f"Task {task_id} not found")
                     async for chunk in send_chunk(ImageChunk(
+                        id=task_id,
                         content="Task not found",
-                        status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
+                        status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0, estimated_wait_time=None),
                         finish_reason="error"
-                    ).model_dump()):
+                    )):
                         yield chunk
                     yield "data: [DONE]\n\n"
                     break
@@ -648,10 +643,11 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                     result = await queue_manager.get_task_result(task_id)
                     if not result:
                         async for chunk in send_chunk(ImageChunk(
+                            id=task_id,
                             content="No result available",
-                            status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
+                            status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0, estimated_wait_time=None),
                             finish_reason="error"
-                        ).model_dump()):
+                        )):
                             yield chunk
                         yield "data: [DONE]\n\n"
                         break
@@ -665,39 +661,55 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                             return
                             
                         is_final_chunk = i + MAX_IMAGE_CHUNK_SIZE >= result_len
-                        chunk_data = ImageChunk(
+                        chunk_obj = ImageChunk(
+                            id=task_id,
                             image_base64=result[i:i + MAX_IMAGE_CHUNK_SIZE],
-                            status=ResponseStatus(status=TaskStatus.COMPLETED, progress=100.0),
+                            status=ResponseStatus(status=TaskStatus.COMPLETED, progress=99.0, estimated_wait_time=None),
                             finish_reason="stop" if is_final_chunk else None
-                        ).model_dump()
+                        )
                         
-                        async for chunk in send_chunk(chunk_data):
+                        async for chunk in send_chunk(chunk_obj):
                             yield chunk
                         
                         # Yield control less frequently due to larger chunks
-                        if i % (MAX_IMAGE_CHUNK_SIZE * 5) == 0:
+                        if i % (MAX_IMAGE_CHUNK_SIZE * 3) == 0:
                             await asyncio.sleep(0)
                     
                     yield "data: [DONE]\n\n"
-                    logger.info(f"Successfully streamed result for task {task_id}")
+                    logger.info(f"Successfully streamed image result for task {task_id}")
                     break
 
                 elif task_status.status == TaskStatus.FAILED:
                     error_msg = task_status.error.message if task_status.error else "Unknown error"
                     async for chunk in send_chunk(ImageChunk(
+                        id=task_id,
                         content=error_msg,
-                        status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
+                        status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0, estimated_wait_time=None),
                         finish_reason="error"
-                    ).model_dump()):
+                    )):
                         yield chunk
                     yield "data: [DONE]\n\n"
                     break
 
                 elif task_status.status == TaskStatus.QUEUED:
+                    # Calculate estimated wait time: queue_position * average_processing_time
+                    estimated_wait_time = None
+                    if task_status.queue_position and task_status.queue_position > 0:
+                        avg_processing_time = queue_manager._get_average_processing_time()
+                        if avg_processing_time:
+                            estimated_wait_time = task_status.queue_position * avg_processing_time
+                    
                     async for chunk in send_chunk(ImageChunk(
-                        content=f"Queued (position: {task_status.queue_position or 'unknown'})",
-                        status=ResponseStatus(status=TaskStatus.QUEUED, progress=0.0)
-                    ).model_dump()):
+                        id=task_id,
+                        content=f"Queued (position: {task_status.queue_position or 'unknown'}/{task_status.total_queue_size or 'unknown'})",
+                        status=ResponseStatus(
+                            status=TaskStatus.QUEUED, 
+                            progress=0.0,
+                            queue_position=task_status.queue_position,
+                            total_queue_size=task_status.total_queue_size,
+                            estimated_wait_time=estimated_wait_time
+                        )
+                    )):
                         yield chunk
                     await adaptive_sleep(poll_attempt)
 
@@ -710,24 +722,31 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
                     else:
                         progress_pct = task_status.progress * 100 if task_status.progress else 0.0
                     
-                    progress_msg = f"Processing... ({int(progress_pct)}%)" if progress_pct > 0 else "Processing..."
+                    progress_msg = f"Generating image... ({int(progress_pct)}%)" if progress_pct > 0 else "Generating image..."
                     async for chunk in send_chunk(ImageChunk(
+                        id=task_id,
                         content=progress_msg,
-                        status=ResponseStatus(status=TaskStatus.PROCESSING, progress=progress_pct)
-                    ).model_dump()):
+                        status=ResponseStatus(
+                            status=TaskStatus.PROCESSING, 
+                            progress=progress_pct,
+                            started_at=task_info.started_at if task_info else None,
+                            estimated_wait_time=None
+                        )
+                    )):
                         yield chunk
                     await adaptive_sleep(poll_attempt)
 
                 poll_attempt += 1
 
         except Exception as e:
-            logger.error(f"Error in stream generator for task {task_id}: {e}")
+            logger.error(f"Error in image stream generator for task {task_id}: {e}")
             try:
                 async for chunk in send_chunk(ImageChunk(
+                    id=task_id,
                     content=f"Stream error: {str(e)}",
                     status=ResponseStatus(status=TaskStatus.FAILED, progress=0.0),
                     finish_reason="error"
-                ).model_dump()):
+                )):
                     yield chunk
                 yield "data: [DONE]\n\n"
             except Exception as cleanup_error:
@@ -735,7 +754,7 @@ async def create_image_generation(request: ImageGenerationRequest, req: Request)
         
         finally:
             # Ensure cleanup happens
-            logger.debug(f"Stream generator cleanup for task {task_id}")
+            logger.debug(f"Image stream generator cleanup for task {task_id}")
     
     return StreamingResponse(optimized_stream_generator(),
             media_type="text/event-stream",
